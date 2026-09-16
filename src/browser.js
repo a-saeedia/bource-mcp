@@ -1,97 +1,109 @@
 /**
- * Guarded Playwright browser for the TSE investor portal.
+ * Guarded browser adapter — reads authenticated TSE portal pages.
  *
- * Designed so that a confused agent can read authenticated pages but CANNOT
- * mutate anything: route interception aborts every non-GET/HEAD request and
- * cancels downloads; navigation is restricted to the host allowlist;
- * credentials never touch the model (cookies come from the encrypted store
- * only, and token-bearing strings are redacted from tool output).
+ * Security model (this is the whole point):
+ *  - The browser context route-intercepts EVERY request. Anything that is
+ *    not GET/HEAD is aborted client-side — even a compromised model cannot
+ *    mutate state, place orders, transfer funds, or change passwords
+ *    through this session.
+ *  - Navigation is restricted to an allowlist of exchange hosts.
+ *  - Downloads / file choosers are cancelled.
+ *  - Saved cookies come from the encrypted session store; the model never
+ *    sees or handles them.
  */
 import { chromium } from 'playwright';
-import { allowedHost, redact } from './guard.js';
-import { loadSession, listSessions } from './session-store.js';
+import { loadSession } from './session-store.js';
+import { allowedHost } from './guard.js';
+import { ALLOW_HOSTS_DEFAULT } from './hosts.js';
 
-export const PORTAL_URL = process.env.BOURCE_PORTAL_URL || 'https://my.tsetmc.com';
+const PORTAL_URL = process.env.BOURCE_PORTAL_URL || 'https://my.tsetmc.com';
 
 let _browser = null;
+let _ctx = null;
 let _page = null;
-let _guardActive = false;
 
-async function getBrowser() {
-  if (_browser && _browser.isConnected()) return _browser;
+async function ensureContext() {
+  if (_ctx) return _ctx;
   _browser = await chromium.launch({ headless: true });
-  return _browser;
-}
+  _ctx = await _browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    acceptDownloads: false,
+  });
 
-export async function openSession({ session = 'tse-portal' } = {}) {
-  const cookies = loadSession(session);
-  if (!cookies) {
-    throw new Error(
-      `no saved session "${session}" — run "npm run login" once (human OTP login in a headed browser), ` +
-        `or pass a session name that exists. Sessions: ${listSessions().map((s) => s.name).join(', ') || 'none'}`
-    );
-  }
-  const ctx = await (await getBrowser()).newContext();
-  const page = await ctx.newPage();
-  await installGuards(ctx);
-  await ctx.addCookies(cookies);
-  _page = page;
-  _guardActive = true;
-  return page;
-}
+  // Restore a human-captured session if present (never credentials).
+  const session = loadSession('tse-portal');
+  if (session?.cookies?.length) await _ctx.addCookies(session.cookies);
 
-function installGuards(ctx) {
-  // Layer 3 — browser-level read-only enforcement.
-  awaitable(ctx.route('**/*', async (route) => {
-    const req = route.request();
-    const method = req.method().toUpperCase();
+  // === THE READ-ONLY GUARD ===
+  await _ctx.route('**/*', async (route) => {
+    const request = route.request();
+    const method = request.method();
     if (method !== 'GET' && method !== 'HEAD') {
-      await route.abort('blockedbyclient');
+      await route.abort('blockedbyclient'); // layer 3: no mutations
       return;
     }
-    // Allow only allowlisted hosts (exfil/redirect guard).
-    if (!allowedHost(req.url())) {
-      await route.abort('blockedbyclient');
+    if (!allowedHost(request.url())) {
+      await route.abort('blockedbyclient'); // layer 4: allowlist only
       return;
     }
     await route.continue();
-  }));
-  ctx.on('download', (d) => d.cancel().catch(() => {}));
-}
-
-function awaitable(p) {
-  if (p && typeof p.then === 'function') p.catch(() => {});
-}
-
-export async function openPage(url) {
-  if (!/^https:/i.test(String(url))) throw new Error('[guard] page_open only allows https:// URLs');
-  if (!allowedHost(url)) throw new Error(`[guard] ${url} is not on the allowlist`);
-  const page = _page || (await openSession());
-  await page.goto(url, { waitUntil: 'networkidle', timeout: 45_000 });
-  return { url: page.url(), title: (await page.title())?.slice(0, 200) ?? null, guarded: _guardActive };
-}
-
-export async function readPage() {
-  if (!_page) throw new Error('no open page — call page_open first');
-  const text = await _page.evaluate(() => {
-    const clone = document.body.cloneNode(true);
-    clone.querySelectorAll('script,style,noscript,svg,img,canvas').forEach((n) => n.remove());
-    return (clone.innerText || '').replace(/\n{3,}/g, '\n\n').slice(0, 14_000);
   });
-  return redact(text);
+
+  // Belt & suspenders vs. form posts (some SPAs POST then GET).
+  _ctx.on('page', (page) => {
+    page.on('download', (d) => d.cancel().catch(() => {}));
+  });
+
+  return _ctx;
 }
 
-export async function closeSession() {
-  if (_browser) { try { await _browser.close(); } catch {} }
-  _browser = null; _page = null; _guardActive = false;
-}
-
-export function sessionMeta() {
+export async function portalInfo() {
+  const session = loadSession('tse-portal');
   return {
-    portal: PORTAL_URL,
-    sessions: listSessions().map((s) => ({ name: s.name, saved_at: new Date(s.savedAt).toISOString() })),
-    guard_active: _guardActive,
-    page_open: Boolean(_page),
-    current_url: _page ? (_page.url() || null) : null,
+    portal_url: PORTAL_URL,
+    session_saved: Boolean(session),
+    session_host: session?.host ?? null,
+    allowlist: (process.env.BOURCE_ALLOW_HOSTS || ALLOW_HOSTS_DEFAULT.join(',')).split(','),
+    read_only: 'enforced at browser level — non-GET requests are aborted client-side',
   };
+}
+
+export async function openPage(url, { waitMs = 1500 } = {}) {
+  if (!/^https:\/\//i.test(url)) {
+    throw new Error('[guard] page_open only accepts https:// URLs');
+  }
+  if (!allowedHost(url) && process.env.BOURCE_ALLOW_ALL_HOSTS !== '1') {
+    throw new Error(`[guard] host not in allowlist: ${new URL(url).hostname}`);
+  }
+  const ctx = await ensureContext();
+  const page = _page ?? (await ctx.newPage());
+  _page = page;
+  const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await page.waitForTimeout(waitMs);
+  return {
+    url: page.url(),
+    title: (await page.title()).slice(0, 200),
+    status: resp?.status() ?? null,
+    note: 'read-only session — non-GET requests are blocked',
+  };
+}
+
+export async function readPage({ selector, maxChars = 20_000 } = {}) {
+  if (!_page) throw new Error('no page open — call page_open first');
+  const root = selector ? _page.locator(selector).first() : _page.locator('body');
+  const text = (await root.innerText().catch(() => '')).trim();
+  return {
+    url: _page.url(),
+    title: (await _page.title().catch(() => '')).slice(0, 200),
+    text: text.slice(0, maxChars),
+  };
+}
+
+export async function closeBrowser() {
+  if (_browser) {
+    await _browser.close().catch(() => {});
+    _browser = _ctx = _page = null;
+  }
 }

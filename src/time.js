@@ -1,61 +1,50 @@
 /**
- * Market session clock — Asia/Tehran.
- * Session: Sat–Wed 09:00–12:30 local. Initiated window keeps the market
- * session open for 30 min after the official close (settlement tail).
+ * Tehran market calendar helpers.
+ * Session: Saturday–Wednesday 09:00–12:30 (Asia/Tehran).
+ * Weekends in Iran are Thursday & Friday.
  */
 
-const TEHRAN_TZ = 'Asia/Tehran';
+const OPEN_DAYS = new Set(['Sat', 'Sun', 'Mon', 'Tue', 'Wed']);
+const OPEN_MIN = 9 * 60;
+const CLOSE_MIN = 12 * 60 + 30;
 
-export function nowInTehran() {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: TEHRAN_TZ,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
+export function tehranParts(date = new Date()) {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Tehran',
+    weekday: 'short',
+    hour: 'numeric',
+    minute: 'numeric',
+    second: 'numeric',
     hour12: false,
-  }).format(new Date());
-}
-
-export function tehranNow() {
-  const parts = nowInTehran().split(/[\/\s:,]+/);
+  });
+  const parts = Object.fromEntries(fmt.formatToParts(date).map((p) => [p.type, p.value]));
   return {
-    date: `${parts[0]}-${parts[1]}-${parts[2]}`, // YYYY-MM-DD
-    ymd: Number(`${parts[0]}${parts[1]}${parts[2]}`), // YYYYMMDD
-    dow: new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: TEHRAN_TZ }).format(new Date()),
-    hh: Number(parts[3]),
-    mm: Number(parts[4]),
+    weekday: parts.weekday,
+    hour: Number(parts.hour) % 24,
+    minute: Number(parts.minute),
+    second: Number(parts.second),
   };
 }
 
-const NO_TRADE = new Set(['Fri', 'Thu']);
-
-/** True when the Tehran market session is currently open. */
-export function isMarketOpen() {
-  const n = tehranNow();
-  if (NO_TRADE.has(n.dow)) return false;
-  const mins = n.hh * 60 + n.mm;
-  return mins >= 9 * 60 && mins <= 12 * 60 + 30 + 30; // 09:00–12:30 + 30 min tail
+export function isMarketOpen(date = new Date()) {
+  const { weekday, hour, minute } = tehranParts(date);
+  if (!OPEN_DAYS.has(weekday)) return false;
+  const t = hour * 60 + minute;
+  return t >= OPEN_MIN && t <= CLOSE_MIN;
 }
 
-export function nextOpen() {
-  const now = new Date();
-  for (let i = 0; i < 8; i++) {
-    const d = nowInTehranAt(now.getTime() + i * 86_400_000);
-    const dw = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: TEHRAN_TZ }).format(new Date(now.getTime() + i * 86_400_000));
-    if (!NO_TRADE.has(dw)) {
-      const [y, m, day] = d.split(/[\/\s:,]+/).slice(0, 3).map(Number);
-      return `${y}-${String(m).padStart(2, '0')}-${String(day).padStart(2, '0')} 09:00`;
-    }
-  }
-  return null;
-}
-
-function nowInTehranAt(ts) {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: TEHRAN_TZ,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-  }).format(new Date(ts));
+export function marketStatus() {
+  const { weekday, hour, minute, second } = tehranParts();
+  const open = isMarketOpen();
+  const clock = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}`;
+  return {
+    market: 'Tehran Stock Exchange (TSE + Fara Bourse via TSETMC)',
+    open,
+    weekday,
+    tehran_time: clock,
+    session: 'Sat–Wed 09:00–12:30 Asia/Tehran',
+    note: open
+      ? 'Market is live now — real-time quotes are current.'
+      : 'Market is closed — live quotes will be empty/stale; rely on last closing prices.',
+  };
 }

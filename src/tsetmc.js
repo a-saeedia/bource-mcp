@@ -1,65 +1,84 @@
 /**
- * TSETMC public API adapter — Tehran Stock Exchange market data.
+ * Public TSETMC adapter (no auth required).
  *
- * Every request funnels through fetchJson() → requestReadOnly() so the
- * GET-only contract holds even for future adapters. Cache is in-memory,
- * keyed by URL, with a TTL. Prices are Rial.
+ * Base: https://cdn.tsetmc.com/api — the JSON API only answers on cdn. No key.
+ * Constraints (from field experience):
+ *  - A browser User-Agent is required (the default node UA gets blocked).
+ *  - The API favors Iranian IPs; foreign/VPN IPs are commonly soft-blocked.
+ *  - Session: Sat–Wed 09:00–12:30 Asia/Tehran. Outside it live prices are empty.
+ *  - Rate limits: prefer bulk endpoints; serialize + backoff on 5xx / block text.
  *
- * Field names are the REAL TSETMC payloads (verified against live data):
- * - quote        : pDrCotVal, pClosing, priceChange, priceMin/Max,
- *                  priceYesterday, priceFirst, zTotTran, qTotTran5J, qTotCap
- * - order book   : BestLimits rows → number, qTitMeDem, zOrdMeDem, pMeDem,
- *                  pMeOf, zOrdMeOf, qTitMeOf
- * - money flow   : ClientType → buy_I_Volume, buy_N_Volume, buy_DDD_Volume,
- *                  buy_CountI/N/DDD, sell_I_Volume, sell_N_Volume, sell_Count*
- * - marketwatch  : rows → lva, lvc, pdv, pcl, pc (=last−yesterday Rial),
- *                  pcpc (=closing−yesterday Rial), pmn/pmx, py, pf, pmd/pmo
- *                  (top-of-book), qtj, qtc, ztt, eps, pe, insCode, insID, flow
+ * Everything here is GET-only by construction — see requestReadOnly().
  */
 import { redact } from './guard.js';
 import { isMarketOpen } from './time.js';
 
-export const TSETMC_BASE = 'https://cdn.tsetmc.com/api';
+const BASE = 'https://cdn.tsetmc.com/api';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const BLOCK_RE = /مسدود|دسترسی شما|General Error Detected/i;
 
-const cache = new Map(); // url -> { at, ttl, json }
+const cache = new Map(); // key -> { at, data }
+let chain = Promise.resolve(); // serialized upstream fan-out
 
-export function clearCache() {
-  cache.clear();
+function serialized(task) {
+  const p = chain.then(task, task);
+  chain = p.catch(() => {});
+  return p;
 }
 
-async function fetchJson(path, { ttl = 0 } = {}) {
-  const url = `${TSETMC_BASE}${path}`;
-  const hit = cache.get(url);
-  if (hit && Date.now() - hit.at < hit.ttl) return hit.json;
-  const res = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/json' } });
-  if (!res.ok) {
-    const msg = `HTTP ${res.status} for ${path}`;
-    const hint =
-      res.status === 403 || res.status === 429
-        ? ' (cdn.tsetmc.com often soft-blocks foreign/VPN IPs — run from an Iranian IP)'
-        : res.status === 404 ? ' (usually a bad insCode)' : '';
-    throw new Error(`${msg}${hint}`);
-  }
-  const raw = await res.text();
-  let json;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    throw new Error(`TSETMC returned non-JSON for ${path}`);
-  }
-  if (ttl > 0) cache.set(url, { at: Date.now(), ttl, json });
-  return json;
+function pull(key, ttl) {
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.at < ttl) return hit.data;
+  return undefined;
 }
 
-function unwrap(payload) {
-  // TSETMC responses nest the array under a single object key; flatten it.
-  const keys = payload && typeof payload === 'object' ? Object.keys(payload) : [];
-  if (keys.length === 1) {
-    const v = payload[keys[0]];
-    if (Array.isArray(v)) return v;
+async function fetchJson(path, { ttl = 60_000, retries = 3 } = {}) {
+  const key = path;
+  const cached = pull(key, ttl);
+  if (cached !== undefined) return cached;
+
+  const run = async () => {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * attempt)); // backoff
+      try {
+        const res = await fetch(BASE + path, {
+          headers: { 'User-Agent': UA, Accept: 'application/json' },
+          signal: AbortSignal.timeout(15_000),
+        });
+        const text = await res.text();
+        if (!res.ok || BLOCK_RE.test(text) || !text.trim().startsWith('{')) {
+          lastErr = new Error(
+            `upstream rejected ${path} (http ${res.status}) — is this machine in Iran and NOT on a foreign VPN? ` +
+              `TSETMC soft-blocks foreign IPs with ${BLOCK_RE.test(text) ? 'a block message' : 'non-JSON'}.`
+          );
+          if (attempt < retries) continue;
+          throw lastErr;
+        }
+        const data = JSON.parse(text);
+        cache.set(key, { at: Date.now(), data });
+        return data;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < retries) continue;
+        throw new Error(
+          `tsetmc network failure for ${path}: ${redact(err.message)} — upstream may be unreachable from this network.`
+        );
+      }
+    }
+    throw lastErr;
+  };
+
+  return serialized(run);
+}
+
+/** Unwrap the single camelCase key TSETMC wraps every response in. */
+function unwrap(data) {
+  if (data && typeof data === 'object') {
+    const keys = Object.keys(data);
+    if (keys.length === 1 && typeof data[keys[0]] !== 'string') return data[keys[0]];
   }
-  return payload;
+  return data;
 }
 
 export async function searchSymbol(query) {

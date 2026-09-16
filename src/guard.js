@@ -46,26 +46,26 @@ export function allowedHost(rawUrl) {
   if (process.env.BOURCE_ALLOW_ALL_HOSTS === '1') return true;
   let host;
   try { host = new URL(rawUrl).hostname.toLowerCase(); } catch { return false; }
-  return hosts.some((h) => {
-    const hh = h.toLowerCase().replace(/^\./, '');
-    return host === hh || host.endsWith('.' + hh);
-  });
+  return hosts.some((h) => host === h || host.endsWith('.' + h));
 }
 
-const HEX_RE = /\b[0-9a-f]{64,}\b/gi;
-const COOKIE_RE = /(?:(?:cookie|set-cookie)\s*[:=]\s*)([^;,`"']+)/gi;
-const TOKEN_RE = /\b(?:bearer|token|authorization|sessionid|jsessionid|apikey|api_key|secret|password|passwd|otp)\b[\s:=]+([^\s,;}]+)/gi;
+/**
+ * Layer 5 — secret redaction. Strip session ids, tokens, authorization
+ * headers and long hex blobs out of anything that flows back to the model.
+ */
+const REDACT_PATTERNS = [
+  /(Authorization|Cookie|Set-Cookie|x-auth[a-z-]*|session[_-]?id|access[_-]?token|refresh[_-]?token|csrf[_-]?token|jwt)[=:]\s*[^\s,;"]+/gi,
+  /(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi,
+  /\b[0-9a-f]{32,}\b/gi,
+];
 
-/** Strip anything that smells like a secret from tool output. */
-export function redact(text) {
-  if (typeof text !== 'string') return text;
-  return String(text)
-    .replace(COOKIE_RE, (m) => m.replace(/[:=].+$/, ': [redacted]'))
-    .replace(TOKEN_RE, (m) => m.replace(/[\s:=]+[^\s,;}]+$/, ' [redacted]'))
-    .replace(HEX_RE, '[redacted-hex]');
+export function redact(input) {
+  if (typeof input !== 'string') return input;
+  let out = input;
+  for (const re of REDACT_PATTERNS) out = out.replace(re, (m, p1) => (p1 ? `${p1}=[REDACTED]` : '[REDACTED]'));
+  return out;
 }
 
-/** Deep-redact any JSON-able structure; strings get passed through redact(). */
 export function redactDeep(value) {
   if (typeof value === 'string') return redact(value);
   if (Array.isArray(value)) return value.map(redactDeep);

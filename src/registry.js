@@ -1,101 +1,117 @@
 /**
- * Tool registry — the ONLY place tools are created.
+ * Tool registry — the SINGLE place tools are declared.
  *
- * Security model layer 1: every name must pass assertReadToolRegistered()
- * (isReadTool allowlist). There is no write path anywhere; if a name isn't
- * on the allowlist the server refuses to start. Adapters live in src/ and
- * are imported here and wrapped into zod-schema'd tools.
- *
- * SDK: @modelcontextprotocol/sdk 1.30.0 — object-style registerTool API.
+ * Layer 1 of the security model: assertReadToolRegistered() refuses to
+ * register any name that is not on the read-only allowlist. There is no
+ * write tool in this project, by construction.
  */
 import { z } from 'zod';
-import {
-  quote, orderBook, moneyFlow, priceHistory, marketWatch,
-  indexOverview, searchSymbol,
-} from './tsetmc.js';
-import { openPage, readPage, sessionMeta } from './browser.js';
-import { isMarketOpen, tehranNow, nextOpen } from './time.js';
-import { assertReadToolRegistered, redact } from './guard.js';
+import { isReadTool, redactDeep } from './guard.js';
+import * as tsetmc from './tsetmc.js';
+import * as time from './time.js';
+import { openPage, readPage, portalInfo } from './browser.js';
+import { listSessions } from './session-store.js';
 
-const insCode = (label) => z.string().describe(label);
-
-function register(server, name, schema, fn) {
-  assertReadToolRegistered(name);
-  server.registerTool(name, { description: schema.description, inputSchema: schema.shape }, fn);
-}
+const ok = (data) => ({ content: [{ type: 'text', text: JSON.stringify(redactDeep(data), null, 2) }] });
 
 export function registerTools(server) {
-  register(server, 'market_status', {
-    description: 'Is the Tehran Stock Exchange market open right now (Sat–Wed 09:00–12:30 Asia/Tehran)? Returns session state and next open day.',
-    shape: z.object({}),
-  }, async () => {
-    const t = tehranNow();
-    return {
-      open: isMarketOpen(),
-      now_tehran: `${t.date} ${String(t.hh).padStart(2, '0')}:${String(t.mm).padStart(2, '0')} (${t.dow})`,
-      session: 'Sat–Wed 09:00–12:30 Asia/Tehran',
-      next_open: nextOpen(),
-    };
-  });
+  const defs = [
+    {
+      name: 'market_status',
+      desc: "Is the Tehran market open right now (Sat–Wed 09:00–12:30 Asia/Tehran)? Local, no network.",
+      params: {},
+      handler: () => ok(time.marketStatus()),
+    },
+    {
+      name: 'search_symbol',
+      desc: 'Search a TSETMC instrument by Persian/English symbol or name (e.g. "فملی", "خودرو", "farda"). Returns insCode + market.',
+      params: { query: z.string().min(1).max(64) },
+      handler: ({ query }) => tsetmc.searchSymbol(query).then(ok),
+    },
+    {
+      name: 'get_quote',
+      desc: 'Live quote for an instrument by insCode (Rial). Stamped with freshness: market_open + staleness_seconds.',
+      params: { insCode: z.string().min(1) },
+      handler: ({ insCode }) => tsetmc.quote(insCode).then(ok),
+    },
+    {
+      name: 'get_order_book',
+      desc: '5-level order book (صف خرید/فروش) for an instrument by insCode.',
+      params: { insCode: z.string().min(1) },
+      handler: ({ insCode }) => tsetmc.orderBook(insCode).then(ok),
+    },
+    {
+      name: 'get_money_flow',
+      desc: 'حقیقی/حقوقی (retail/institutional) money-flow summary for an instrument by insCode.',
+      params: { insCode: z.string().min(1) },
+      handler: ({ insCode }) => tsetmc.moneyFlow(insCode).then(ok),
+    },
+    {
+      name: 'get_price_history',
+      desc: 'Daily OHLCV history (Rial) for an instrument by insCode. Fresh full-market pull is cached 1h.',
+      params: {
+        insCode: z.string().min(1),
+        top: z.number().int().min(1).max(2000).default(260),
+      },
+      handler: ({ insCode, top }) => tsetmc.priceHistory(insCode, top).then(ok),
+    },
+    {
+      name: 'get_market_watch',
+      desc: 'Whole-market snapshot (market=0 all, 1 bourse, 2 fara-bourse, 4 payeh). Prefer this over per-symbol loops.',
+      params: {
+        flow: z.number().int().min(0).max(4).default(0),
+        top: z.number().int().min(1).max(1000).default(200),
+      },
+      handler: ({ flow, top }) => tsetmc.marketWatch({ flow, top }).then(ok),
+    },
+    {
+      name: 'get_index_overview',
+      desc: 'Market overview / index values (flow 1 = bourse, 2 = fara-bourse).',
+      params: { flow: z.number().int().min(1).max(2).default(1) },
+      handler: ({ flow }) => tsetmc.indexOverview(flow).then(ok),
+    },
+    {
+      name: 'session_status',
+      desc: 'Which authenticated portal sessions exist (never exposes credentials) and the browser allowlist.',
+      params: {},
+      handler: async () => {
+        const sessions = listSessions().map((s) => s.name);
+        return ok({ sessions, portal: await portalInfo() });
+      },
+    },
+    {
+      name: 'page_open',
+      desc: 'Open a page on the TSE/TSETMC portal with the saved read-only session. Non-GET requests are blocked.',
+      params: {
+        url: z.string().url().refine((u) => u.startsWith('https://'), 'https only'),
+        waitMs: z.number().int().min(0).max(10_000).default(1500),
+      },
+      handler: ({ url, waitMs }) => openPage(url, { waitMs }).then(ok),
+    },
+    {
+      name: 'page_read',
+      desc: 'Extract readable text (and tables as text) from the currently open portal page. Truncated to maxChars.',
+      params: {
+        selector: z.string().optional(),
+        maxChars: z.number().int().min(500).max(100_000).default(20_000),
+      },
+      handler: ({ selector, maxChars }) => readPage({ selector, maxChars }).then(ok),
+    },
+  ];
 
-  register(server, 'search_symbol', {
-    description: 'Search the Tehran Stock Exchange instrument list by Persian symbol (فملی) or partial English name (farda). Returns insCode(s) to use with get_quote/get_order_book/get_money_flow.',
-    shape: z.object({ query: z.string().min(1).describe('symbol or name fragment') }),
-  }, async ({ query }) => redact(await searchSymbol(query)));
-
-  register(server, 'get_quote', {
-    description: 'Live quote for an instrument by insCode: last/closing price, change %, OHLC, volume, value, trades, plus a freshness stamp (Rial).',
-    shape: z.object({ insCode: insCode('17-digit TSETMC instrument code from search_symbol') }),
-  }, async ({ insCode: code }) => redact(await quote(code)));
-
-  register(server, 'get_order_book', {
-    description: 'Order book (صف خرید/فروش) for an instrument by insCode: 5 price levels with bid/ask volume and order counts.',
-    shape: z.object({ insCode: insCode('17-digit TSETMC instrument code from search_symbol') }),
-  }, async ({ insCode: code }) => ({ levels: redact(await orderBook(code)) }));
-
-  register(server, 'get_money_flow', {
-    description: 'Retail vs institutional (حقیقی/حقوقی) buy/sell flow for an instrument by insCode, in shares.',
-    shape: z.object({ insCode: insCode('17-digit TSETMC instrument code from search_symbol') }),
-  }, async ({ insCode: code }) => redact(await moneyFlow(code)));
-
-  register(server, 'get_price_history', {
-    description: 'Daily OHLCV history for an instrument by insCode (most recent N sessions, default 60, max 260).',
-    shape: z.object({
-      insCode: insCode('17-digit TSETMC instrument code from search_symbol'),
-      top: z.number().int().min(1).max(260).default(60).describe('number of sessions (default 60)'),
-    }),
-  }, async ({ insCode: code, top }) => ({ sessions: redact(await priceHistory(code, top)) }));
-
-  register(server, 'get_market_watch', {
-    description: 'Whole-market snapshot: top movers, prices, volumes for every instrument (bourse flow=0/1, fara-bourse=2). Prefer this over per-symbol loops.',
-    shape: z.object({
-      flow: z.number().int().min(0).max(4).default(0).describe('market: 0=all, 1=bourse, 2=fara-bourse, 3=options'),
-      top: z.number().int().min(1).max(1000).default(200).describe('max rows to return'),
-    }),
-  }, async ({ flow, top }) => ({ instruments: redact(await marketWatch({ flow, top })) }));
-
-  register(server, 'get_index_overview', {
-    description: 'Market index overview for bourse (1) or fara-bourse (2): index value, change, trades, volume, value today.',
-    shape: z.object({ flow: z.number().int().min(1).max(2).default(1).describe('1=bourse, 2=fara-bourse') }),
-  }, async ({ flow }) => redact(await indexOverview(flow)));
-
-  // ---- portal (browser) tools — read-only, guarded ----
-
-  register(server, 'session_status', {
-    description: 'Which TSE portal sessions exist (name + save time). Shows no credentials. Requires a login once via `npm run login` before page_open.',
-    shape: z.object({}),
-  }, async () => redact(sessionMeta()));
-
-  register(server, 'page_open', {
-    description: 'Open an https:// page on the TSE portal allowlist (my.tsetmc.com / tsetmc.com / tse.ir / webgw.tse.ir) using the saved read-only session. Navigation to any other host is refused.',
-    shape: z.object({
-      url: z.string().describe('https URL on an allowed exchange host'),
-      session: z.string().default('tse-portal').describe('session name from session_status'),
-    }),
-  }, async ({ url, session }) => redact(await openPage({ url, session })));
-
-  register(server, 'page_read', {
-    description: 'Read readable text/tables from the currently open portal page (nothing actionable — GET-only, redacted).',
-    shape: z.object({}),
-  }, async () => ({ text: await readPage() }));
+  for (const def of defs) {
+    // Layer 1: the allowlist guard. A non-read name can never be registered.
+    if (!isReadTool(def.name)) {
+      throw new Error(`[guard] "${def.name}" is not on the read-only tool allowlist — registration refused.`);
+    }
+    const hasParams = Object.keys(def.params ?? {}).length > 0;
+    server.registerTool(
+      def.name,
+      {
+        description: def.desc,
+        inputSchema: hasParams ? def.params : undefined,
+      },
+      async (args) => def.handler(args ?? {})
+    );
+  }
 }

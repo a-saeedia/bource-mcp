@@ -1,0 +1,24 @@
+{
+  "name": "bource-mcp",
+  "version": "0.1.0",
+  "description": "Read-only MCP bridge for the Iran Bourse: TSETMC (Tehran Stock Exchange) market data + guarded, authenticated TSE portal session. Works with opencode and any MCP client.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "bource-mcp": "./server.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "login": "node scripts/login.mjs",
+    "register": "node scripts/register-opencode.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "playwright": "^1.63.0",
+    "zod": "^4.6.5"
+  }
+}

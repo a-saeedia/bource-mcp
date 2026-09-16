@@ -54,7 +54,7 @@ export function allowedHost(rawUrl) {
  * headers and long hex blobs out of anything that flows back to the model.
  */
 const REDACT_PATTERNS = [
-  /(Authorization|Cookie|Set-Cookie|x-auth[a-z-]*|session[_-]?id|access[_-]?token|refresh[_-]?token|csrf[_-]?token|jwt)[=:]\s*[^\s,;"]+/gi,
+  /(Authorization|Cookie|Set-Cookie|x-auth[a-z-]*|session[_-]?id|access[_-]?token|refresh[_-]?token|csrf[_-]?token|jwt)[=:]\s*[^\s,;"']+/gi,
   /(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi,
   /\b[0-9a-f]{32,}\b/gi,
 ];
